@@ -202,17 +202,21 @@ from .ctx_manager import (
 from .dicts import ConstDictVariable, MappingProxyVariable, SetVariable
 from .distributed import WorldMetaClassVariable
 from .functions import (
-    BuiltinMethodVariable,
+    BoundBuiltinMethodVariable,
     CollectionsNamedTupleFunction,
     CollectiveFunctionRewriteVariable,
     CreateTMADescriptorExperimentalVariable,
     CreateTMADescriptorStableVariable,
     FunctoolsPartialVariable,
     GetSetDescriptorVariable,
+    MemberDescriptorVariable,
+    MethodDescriptorVariable,
+    MethodWrapperVariable,
     SysFunctionVariable,
     TritonKernelVariable,
     TritonSetAllocatorVariable,
     UserFunctionVariable,
+    WrapperDescriptorVariable,
     WrapperUserFunctionVariable,
 )
 from .higher_order_ops import (
@@ -237,7 +241,6 @@ from .misc import (
     AutogradFunctionVariable,
     ComptimeVariable,
     ConstantLikeVariable,
-    ConstantMethodWrapperVariable,
     DebuggingVariable,
     DelayGraphBreakVariable,
     GetAttrVariable,
@@ -728,6 +731,42 @@ class VariableBuilder:
 
         return result
 
+    # Descriptor types that produce builtin_function_or_method when bound:
+    #   - MethodDescriptorType: e.g. list.append -> [].append
+    #   - BuiltinFunctionType: e.g. tuple.__new__ (stored directly in type dict)
+    _BOUND_BUILTIN_DESCRIPTOR_TYPES = (
+        types.MethodDescriptorType,
+        types.BuiltinFunctionType,
+    )
+
+    def _try_build_bound_builtin_method(
+        self, value: Any
+    ) -> VariableTracker | None:
+        """Try to build a BoundBuiltinMethodVariable for a bound C method.
+
+        Only handles builtin_function_or_method values backed by a known
+        descriptor type in the MRO. Returns None for pybind11 methods
+        and module-level C functions which bypass the descriptor protocol.
+        """
+        if not isinstance(value, types.BuiltinMethodType):
+            return None
+        if value.__self__ is None:
+            return None
+        obj = value.__self__
+        descriptor = None
+        for klass in type(obj).__mro__:
+            if value.__name__ in klass.__dict__:
+                descriptor = klass.__dict__[value.__name__]
+                break
+        if not isinstance(descriptor, self._BOUND_BUILTIN_DESCRIPTOR_TYPES):
+            return None
+        self.install_guards(GuardBuilder.ID_MATCH)
+        obj_source = self.source and AttrSource(self.source, "__self__")
+        obj_vt = VariableTracker.build(self.tx, obj, obj_source)
+        return BoundBuiltinMethodVariable(
+            descriptor, obj_vt, value.__name__, source=self.source
+        )
+
     def _wrap(self, value: Any) -> VariableTracker:
         # import here to avoid circular dependencies
         from torch.utils._triton import (
@@ -1175,6 +1214,14 @@ class VariableBuilder:
             return ErrorOnGraphBreakVariable(value.error_on_graph_break)
         elif isinstance(value, CudagraphOverrideContextManager):
             return CudagraphOverrideVariable(value.fwd, value.bwd)
+        elif isinstance(value, types.WrapperDescriptorType):
+            self.install_guards(GuardBuilder.ID_MATCH)
+            return WrapperDescriptorVariable(value, source=self.source)
+        elif isinstance(value, types.MethodDescriptorType):
+            self.install_guards(GuardBuilder.ID_MATCH)
+            return MethodDescriptorVariable(value, source=self.source)
+        elif (result := self._try_build_bound_builtin_method(value)) is not None:
+            return result
         elif callable(value) and trace_rules.lookup_callable(value) is not None:
             if trace_rules.is_callable_allowed(value):
                 self.tx.output.has_user_defined_allowed_in_graph = True
@@ -1450,11 +1497,6 @@ class VariableBuilder:
         elif value is collections.namedtuple:
             self.install_guards(GuardBuilder.ID_MATCH)
             return CollectionsNamedTupleFunction(value, source=self.source)
-        elif isinstance(
-            value, types.BuiltinMethodType
-        ) and BuiltinMethodVariable.is_supported_builtin_method(value):
-            self.install_guards(GuardBuilder.ID_MATCH)
-            return BuiltinMethodVariable(value, source=self.source)
         elif is_function(value) and value in (float.fromhex, float.hex):
             self.install_guards(GuardBuilder.ID_MATCH)
             return GetAttrVariable(
@@ -1502,12 +1544,35 @@ class VariableBuilder:
             # accesses. Since these are unlikely to change during the program
             # execution, we can skip guarding on them.
             return GetSetDescriptorVariable(value)
+        elif isinstance(value, types.MemberDescriptorType):
+            self.install_guards(GuardBuilder.ID_MATCH)
+            return MemberDescriptorVariable(value, source=self.source)
         elif isinstance(value, types.MethodWrapperType):
-            # Method-wrappers are written in C, and they are not guaranteed to
-            # return the same object on attribute lookup. Therefore, we cannot
-            # insert a ID_MATCH guard here. method-wrappers are very
-            # unlikely to change, so its ok to skip the guard here.
-            return ConstantMethodWrapperVariable(value)
+            # A method-wrapper is always produced by wrapperdescr_get
+            # binding a wrapper_descriptor to an instance. Walk the MRO
+            # to find the unbound descriptor.
+            obj = value.__self__
+            descriptor = None
+            for klass in type(obj).__mro__:
+                if value.__name__ in klass.__dict__:
+                    descriptor = klass.__dict__[value.__name__]
+                    break
+            assert isinstance(descriptor, types.WrapperDescriptorType)
+            # For desc.__get__ method-wrappers, __self__ is the descriptor
+            # itself, so source.__self__ == source.base. Use the shorter
+            # path to avoid redundant AttrSource chains.
+            if (
+                self.source
+                and isinstance(self.source, AttrSource)
+                and self.source.member == "__get__"
+            ):
+                obj_source = self.source.base
+            else:
+                obj_source = self.source and AttrSource(self.source, "__self__")
+            obj_vt = VariableTracker.build(self.tx, obj, obj_source)
+            return MethodWrapperVariable(
+                descriptor, obj_vt, value.__name__, source=self.source
+            )
         elif issubclass(type(value), type) and issubclass(value, BaseException):
             # match user defined exceptions
             self.install_guards(GuardBuilder.ID_MATCH)
@@ -4314,6 +4379,10 @@ class SourcelessBuilder:
             return UserDefinedObjectVariable(value)
         elif ConstantVariable.is_literal(value):
             return ConstantVariable.create(value)
+        elif isinstance(value, types.WrapperDescriptorType):
+            return WrapperDescriptorVariable(value)
+        elif isinstance(value, types.MethodDescriptorType):
+            return MethodDescriptorVariable(value)
         elif callable(value) and trace_rules.lookup_callable(value) is not None:
             if trace_rules.is_callable_allowed(value):
                 tx.output.has_user_defined_allowed_in_graph = True
@@ -4339,7 +4408,15 @@ class SourcelessBuilder:
                 return UserDefinedExceptionClassVariable(value)
             return UserDefinedClassVariable(value)
         elif isinstance(value, types.MethodWrapperType):
-            return ConstantMethodWrapperVariable(value)
+            obj = value.__self__
+            descriptor = None
+            for klass in type(obj).__mro__:
+                if value.__name__ in klass.__dict__:
+                    descriptor = klass.__dict__[value.__name__]
+                    break
+            assert isinstance(descriptor, types.WrapperDescriptorType)
+            obj_vt = SourcelessBuilder.create(tx, obj)
+            return MethodWrapperVariable(descriptor, obj_vt, value.__name__)
         elif isinstance(value, types.MethodType):
             if isinstance(value.__self__, (type, abc.ABCMeta)):
                 # value is a classmethod
@@ -4464,6 +4541,9 @@ class SourcelessBuilder:
         )
         handlers[types.GetSetDescriptorType] = (
             lambda tx, value: GetSetDescriptorVariable(value)
+        )
+        handlers[types.MemberDescriptorType] = (
+            lambda tx, value: MemberDescriptorVariable(value)
         )
         handlers[inspect.Parameter] = lambda tx, value: UserDefinedObjectVariable(
             value, mutation_type=ValueMutationNew()

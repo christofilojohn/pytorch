@@ -673,6 +673,10 @@ class UserFunctionVariable(BaseUserFunctionVariable):
     def var_getattr(self, tx: "InstructionTranslator", name: str) -> VariableTracker:
         if name == "__dict__":
             return super().var_getattr(tx, name)
+        elif name == "__get__":
+            source = self.get_source()
+            source = source and AttrSource(source, "__get__")
+            return VariableTracker.build(tx, self.fn.__get__, source)
         elif name in cmp_name_to_op_mapping:
             return variables.GetAttrVariable(
                 self, name, py_type=type(getattr(self.fn, name))
@@ -685,6 +689,20 @@ class UserFunctionVariable(BaseUserFunctionVariable):
     ) -> ConstantVariable:
         result = hasattr(self.fn, name)
         return VariableTracker.build(tx, result)
+
+    def tp_descr_get_impl(
+        self,
+        tx: "InstructionTranslator",
+        obj: VariableTracker,
+        name: str,
+    ) -> VariableTracker:
+        # Mirrors func_descr_get which calls PyMethod_New to bind
+        # the function to an instance.
+        # https://github.com/python/cpython/blob/3.13/Objects/funcobject.c#L1119
+        source = obj.source and AttrSource(obj.source, self.fn.__name__)
+        return UserMethodVariable(
+            self.fn, obj, source_fn=self.source, source=source
+        )
 
     def call_function(
         self,
@@ -1060,40 +1078,6 @@ class TreeMapOnlyFunctionVariable(BaseUserFunctionVariable):
             return self.map_fn.call_function(tx, args, kwargs)
         return leaf
 
-
-class BuiltinMethodVariable(BaseUserFunctionVariable):
-    def __init__(
-        self, fn: types.BuiltinMethodType, is_constant: bool = False, **kwargs: Any
-    ) -> None:
-        super().__init__(**kwargs)
-        assert isinstance(fn, types.BuiltinMethodType)
-        self.fn = fn
-
-    def python_type(self) -> type:
-        return types.BuiltinMethodType
-
-    @staticmethod
-    def is_supported_builtin_method(obj: Any) -> bool:
-        method_self = obj.__self__
-        method_name = obj.__name__
-
-        # TODO(anijain2305) - Add support for more builtin methods
-        # Supports tuple.__new__ and frozenset({....}).__contains__
-        return (method_self is tuple and method_name == "__new__") or (
-            type(method_self) is frozenset and method_name == "__contains__"
-        )
-
-    def call_function(
-        self,
-        tx: "InstructionTranslator",
-        args: Sequence[VariableTracker],
-        kwargs: dict[str, VariableTracker],
-    ) -> VariableTracker:
-        method_self = self.fn.__self__
-        name = self.fn.__name__
-        obj_source = self.source and AttrSource(self.source, "__self__")
-        obj_vt = VariableTracker.build(tx, method_self, obj_source, realize=True)
-        return obj_vt.call_method(tx, name, args, kwargs)
 
 
 class LocalGeneratorObjectVariable(VariableTracker):
@@ -3944,13 +3928,15 @@ class BoundBuiltinMethodVariable(VariableTracker):
 
     def __init__(
         self,
-        descriptor: types.MethodDescriptorType,
+        descriptor: types.MethodDescriptorType | types.BuiltinFunctionType,
         obj: VariableTracker,
         name: str,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
-        assert isinstance(descriptor, types.MethodDescriptorType)
+        assert isinstance(
+            descriptor, (types.MethodDescriptorType, types.BuiltinFunctionType)
+        )
         assert isinstance(obj, VariableTracker)
         self.descriptor = descriptor
         self.obj = obj
